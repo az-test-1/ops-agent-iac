@@ -1,0 +1,177 @@
+name: access-expiry
+
+# 매시간(또는 수동 실행) dev/prod의 db-access + ec2-ssh surface를 훑어서
+# expires_at(ISO 8601, UTC)이 지난 권한을 회수하는 PR을 연다.
+# 브랜치=환경 매핑: dev 파일의 정본은 dev 브랜치, prod는 main이다. 그래서 env마다
+# 자기 base 브랜치에서 sweep하고 그 브랜치로 PR을 연다:
+#   - dev PR(base=dev)   — 무소유 access 원본에서 만료 grant를 제거 → guard 후 자동 머지.
+#   - prod PR(base=main) — 사람 소유 원본은 보존하고, 권한을 줄이기만 하는 전용
+#                          revocation 파일을 갱신 → guard 후 자동 머지.
+# 머지되면 tf-apply가 실제로 AWS에서 해당 액세스를 회수한다.
+on:
+  workflow_dispatch:
+  # 시나리오 2/3 prod의 "만료 시 자동 회수" 약속을 이행하는 무인 스윕(2026-07-16
+  # e2e C1-I2, 사용자 결정으로 재추가). 10분 주기 — 만료 후 회수 착수까지 최대 10분.
+  # public 리포(학생 기본)는 GitHub-hosted runner가 무료라 비용 0. private 리포에선
+  # 이 주기가 월 수천 분을 소모해 Actions 한도(Free 2,000 / Pro 3,000분)를 넘을 수
+  # 있다 — private 유지 시 이 워크플로를 disable하거나 주기를 매시로 되돌릴 것.
+  schedule:
+    - cron: "*/10 * * * *"
+
+# push/PR은 아래에서 발급하는 GitHub App 토큰이 처리한다 — GITHUB_TOKEN에는
+# checkout용 read만 있으면 된다.
+permissions:
+  contents: read
+
+# cron과 수동 dispatch가 겹치면 두 실행이 같은 봇 브랜치(ops/access-expiry-*)에
+# force-push와 PR 생성을 동시에 시도해 레이스가 난다. 같은 group 문자열을 가진
+# 실행은 리포 전체에서 동시에 1개만 돈다. cancel-in-progress: false — 진행 중인
+# sweep을 중간에 죽이지 않고 끝까지 돌린 뒤 대기하던 실행을 시작한다(중간에
+# 끊으면 push만 되고 PR은 안 열린 반쪽 상태가 남을 수 있다).
+concurrency:
+  group: access-expiry
+  cancel-in-progress: false
+
+jobs:
+  expire:
+    name: 만료된 임시 액세스 권한 정리
+    runs-on: ubuntu-latest
+    steps:
+      # 기본 GITHUB_TOKEN으로 만든 이벤트(브랜치 push, PR open)는 다른 워크플로를
+      # 트리거하지 않는다 — GitHub이 재귀를 막으려고 억제하기 때문이다. 그러면
+      # expiry PR에 guard / tf-plan이 안 돌고, 머지돼도 tf-apply가 돌지 않는다.
+      # 그래서 이 워크플로는 GitHub App(contents+pull_requests write) 토큰을
+      # 필수로 요구한다 — App 토큰이 만든 이벤트는 CI를 정상 트리거한다.
+      # 시크릿 등록은 2-0-setup/2-github/README.md의 3번(App 만들기) 절 끝 단계 참고.
+      - name: 필수 시크릿 확인 (EXPIRY_APP_ID / EXPIRY_APP_PRIVATE_KEY)
+        env:
+          # secrets context는 if: 표현식에서 못 쓴다(워크플로 파일 자체가 invalid 판정).
+          # 존재 여부만 env로 내려서 검사한다(값 자체는 env에 싣지 않는다).
+          HAS_APP_ID: ${{ secrets.EXPIRY_APP_ID != '' }}
+          HAS_APP_KEY: ${{ secrets.EXPIRY_APP_PRIVATE_KEY != '' }}
+        run: |
+          if [ "${HAS_APP_ID}" != "true" ] || [ "${HAS_APP_KEY}" != "true" ]; then
+            echo "::error::EXPIRY_APP_ID / EXPIRY_APP_PRIVATE_KEY 시크릿이 없습니다. 2-0-setup/2-github/README.md 3번 절(App 만들기) 끝의 'gh secret set' 단계로 에이전트 App 자격증명을 등록한 뒤 다시 실행하세요."
+            exit 1
+          fi
+
+      - uses: actions/checkout@v5
+        with:
+          # 기본값(true)은 GITHUB_TOKEN을 git 설정에 남긴다. 여기서는 push를 App
+          # 토큰으로 하므로(위 주석 참고) read 전용 토큰을 남길 이유가 없다 —
+          # 자격증명은 아래 push 스텝에서 App 토큰으로 명시적으로 주입한다.
+          persist-credentials: false
+          # env별 base 브랜치(dev/main) 둘 다에서 sweep해야 하므로 전체 이력을 받는다.
+          # 기본 shallow(depth 1)면 origin/dev가 로컬에 없어 아래 checkout -B가 실패한다.
+          fetch-depth: 0
+
+      - name: GitHub App 토큰 발급 (트리거 가능한 정체성)
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ secrets.EXPIRY_APP_ID }}
+          private-key: ${{ secrets.EXPIRY_APP_PRIVATE_KEY }}
+
+      - name: 만료 액세스 sweep + expiry PR 열기 (env별 base 브랜치)
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote set-url origin \
+            "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+
+          # schedule 워크플로의 정본(main)에 있는 스위퍼를 보존한다. 아래에서 dev
+          # 브랜치를 checkout해도 최신 --environment/revocation 동작을 사용해야 한다.
+          cp scripts/expire_access.py "${RUNNER_TEMP}/expire_access.py"
+
+          # env 하나의 expiry 브랜치 + PR을 만든다. 파일의 정본이 env마다 다른
+          # 브랜치에 있으므로(dev=dev 브랜치, prod=main), env의 base에서 checkout한다.
+          # dev는 원본 grant 파일을, prod는 machine-owned revocation 파일만 commit한다.
+          # 인자: env_name(dev|prod) env_dir(surface 파일 디렉터리) base(PR 대상 브랜치).
+          open_env_pr() {
+            local env_name="$1" env_dir="$2" base="$3"
+            local branch="ops/access-expiry-${env_name}"
+            local changed_paths=()
+            if [ "${env_name}" = "dev" ]; then
+              changed_paths=(
+                "${env_dir}/db-access.auto.tfvars.json"
+                "${env_dir}/ec2-ssh.auto.tfvars.json"
+              )
+            else
+              changed_paths=("${env_dir}/access-expiry.auto.tfvars.json")
+            fi
+
+            git checkout -q -f -B "${branch}" "origin/${base}"
+            python3 "${RUNNER_TEMP}/expire_access.py" \
+              --root "${GITHUB_WORKSPACE}" \
+              --environment "${env_name}" \
+              | tee "${RUNNER_TEMP}/expired-${env_name}.txt"
+            if git diff --quiet -- "${changed_paths[@]}"; then
+              echo "no expired grants (${env_name})"
+              # base가 갱신돼 이전 expiry diff가 더는 필요 없는데 PR만 남아 있으면,
+              # 그 stale PR이 나중에 머지되지 않도록 스케줄러가 자기 PR을 닫는다.
+              local stale_pr
+              stale_pr=$(gh pr list --head "${branch}" --base "${base}" --state open \
+                --json number --jq '.[0].number // empty')
+              if [ -n "${stale_pr}" ]; then
+                gh pr close "${stale_pr}" \
+                  --comment "Expiry sweep now has no diff against ${base}; closing stale bot PR."
+              fi
+              # 스위퍼가 남겼을 수 있는 워킹트리 변경을 되돌려 다음 env 처리를
+              # 깨끗한 상태에서 시작한다(현재 스위퍼는 changed_paths만 쓰므로 보험).
+              git checkout -q -f -- .
+              return 0
+            fi
+            git add -- "${changed_paths[@]}"
+            # index에 올린 변경만 커밋되도록 나머지 워킹트리 변경을 정리한다 —
+            # 스위퍼가 예상 밖 파일을 건드리는 회귀가 생겨도 커밋 범위가 안 넓어진다.
+            git checkout -q -f -- .
+            git commit -m "chore: expire temporary access grants (${env_name})"
+            # 여기서 --force는 안전하다: ops/access-expiry-*는 봇 소유이며 이
+            # 워크플로만 쓴다. 스윕은 결정적이라, re-push 하면 기존에 열려 있던
+            # expiry PR도 현재 상태로 수렴한다.
+            git push --force origin "${branch}"
+
+            {
+              echo "Automated sweep (${env_name}): revoked access grants whose \`expires_at\`"
+              echo "is in the past (UTC). Base branch: \`${base}\`."
+              echo
+              echo '```'
+              cat "${RUNNER_TEMP}/expired-${env_name}.txt"
+              echo '```'
+              echo
+              if [ "${env_name}" = "dev" ]; then
+                echo "dev access surfaces are CODEOWNERS-unowned - the auto-merge workflow"
+                echo "merges this PR once the \`guard\` check passes."
+              else
+                echo "The prod grant sources remain CODEOWNERS-owned. This PR changes only the"
+                echo "machine-owned revocation file and auto-merges after \`guard\` succeeds."
+              fi
+              echo "Merging this PR triggers tf-apply, which revokes the access in AWS."
+            } > "${RUNNER_TEMP}/pr-body-${env_name}.md"
+
+            # 열려 있는 expiry PR이 있으면 재사용하고(위 force-push가 이미 내용을
+            # 갱신했다), 없으면 새로 연다.
+            local open_prs
+            open_prs=$(gh pr list --head "${branch}" --base "${base}" --state open \
+              --json number --jq 'length')
+            if [ "${open_prs}" -gt 0 ]; then
+              echo "expiry PR already open for ${branch} - branch updated, no new PR"
+            else
+              gh pr create \
+                --base "${base}" \
+                --head "${branch}" \
+                --title "[ops] expire temporary access (${env_name})" \
+                --body-file "${RUNNER_TEMP}/pr-body-${env_name}.md"
+            fi
+
+            # 머지는 auto-merge 워크플로가 담당한다(App 토큰 PR이라 정상 트리거됨).
+            # 여기서 gh pr merge --auto를 직접 켜면 ruleset 미강제 환경(private+free)
+            # 에서 guard 보고 전에 즉시 머지돼 게이트를 우회한다 — 호출 금지.
+          }
+
+          open_env_pr dev 2-1-dev dev
+          open_env_pr prod 2-2-prod main

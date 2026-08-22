@@ -1,0 +1,80 @@
+# Code owners — 여기서 auto vs human 승인이 갈린다.
+#
+# Owner: @wo-o. 템플릿으로 만든 수강생은 @wo-o을 자기 핸들로 치환한다.
+#
+# 설계: ruleset은 required_approving_review_count=0 + require_code_owner_review=true.
+#   - 무소유 경로만 건드린 PR(auto) → code-owner 없음·승인 0 → guard 통과 시 자동 머지
+#   - 소유된 경로를 건드린 PR(human) → code-owner 리뷰 필수 → 사람 대기
+#
+# 환경별 거버넌스(dev=느슨, prod=엄격):
+#   - dev surface (2-1-dev/*.auto.tfvars(.json)) → 무소유 = 자동 머지
+#   - prod 원본은 소유 = 사람 승인 필수. 예외는 권한을 줄이기만 하는 expiry
+#     revocation 상태와 incident WAF surface(소유자 없는 라인 = 소유 해제).
+# 값 경계는 각 root/모듈의 terraform variable validation(1차) +
+# tf-plan.yml의 비용 가드레일(2차, .github/은 사람 소유라 에이전트가 못 끔)이 강제한다.
+# ansible 파라미터의 값 경계는 ansible/specs/ 스펙이 선언한다 — specs/는 dev
+# 사본에서도 사람 소유(2026-08-07: 파라미터 조치의 입력 계약은 사람이 승인).
+#
+# 이 파일은 브랜치별로 다르다(CODEOWNERS는 PR base 브랜치의 사본이 적용된다):
+#   - main(이 사본): 모든 .tf·ansible 사람 소유 — dev→main 승격 PR의 게이트.
+#   - dev 사본: modules/·2-1-dev/·ansible/ 소유를 해제해 에이전트가 dev에서
+#     IaC 코드로 기능을 추가할 수 있다(ansible/specs/는 예외 — 소유 유지).
+#     prod 반영은 승격 PR에서 사람이 승인.
+
+# 모든 terraform 정의(모듈·루트·setup)는 사람 소유 — 에이전트는 .tf를 못 건드린다.
+# (main 기준. dev 브랜치 사본은 modules/·2-1-dev/를 아래쪽 라인으로 해제한다.)
+*.tf                @wo-o
+
+# prod 환경 게이트 — surface 파일별 라인으로 분리. 기본은 전부 사람 소유(디렉토리
+# 라인). 특정 surface만 자동으로 전환하려면 해당 파일 라인의 @wo-o만 지운다
+# (마지막 매칭 우선 — 파일 라인이 디렉토리 라인을 덮는다).
+/2-2-prod/                            @wo-o
+/2-2-prod/service.auto.tfvars         @wo-o
+/2-2-prod/env.auto.tfvars             @wo-o
+/2-2-prod/ec2-ssh.auto.tfvars.json    @wo-o
+/2-2-prod/db-access.auto.tfvars.json  @wo-o
+# 만료 스위퍼가 쓰는 revoke-only 상태. 원본 grant는 위 두 파일에서 계속 사람
+# 소유하고, 이 파일은 동일 id+cidr+expires_at을 비활성화할 수만 있어 신규 권한을 못 만든다.
+/2-2-prod/access-expiry.auto.tfvars.json
+/2-2-prod/disk.auto.tfvars            @wo-o
+/2-2-prod/dns.auto.tfvars.json        @wo-o
+# 2-06 WAF surface(존 전역, prod root 소유 — 구 2-4-waf 통합 2026-07-20)는
+# 의도적으로 UNOWNED: incident 차단은 auto. 구조(waf.tf)는 *.tf 규칙이 소유.
+/2-2-prod/waf.auto.tfvars.json
+
+# CI, 스크립트, ansible, 가드레일. 부트스트랩/깃헙 셋업은 2-0-setup/(bootstrap·teardown)
+# 과 2-0-setup/2-github/ 로 옮겨져 /2-0-setup/ 소유에 포함된다.
+/.github/           @wo-o
+/scripts/           @wo-o
+/ansible/           @wo-o
+/2-0-setup/         @wo-o
+
+# 환경 델타(구조값: environment/private_subnet_cidrs) — 에이전트 surface가 아니라
+# 사람 소유(main 사본 기준 — 승격 머지에 섞여 올 때 리뷰 대상). dev 사본은 말미의
+# dev 전용 블록이 /2-1-dev/ 전체를 해제해 이 파일도 auto다(사용자 결정 2026-07-20).
+/2-1-dev/env.auto.tfvars   @wo-o
+
+# dev service surface (service_enabled) is intentionally UNOWNED: dev stack
+# setup/teardown auto-merges once guard passes — including the destructive
+# service_enabled=false destroy. prod stays gated via /2-2-prod/ above.
+
+# 2-08 packages surface (ansible/patch-extra-packages.yml)는 의도적으로 UNOWNED:
+# 봇 PR이 guard 통과 시 auto-merge된다(/ansible/ 소유의 예외 — 이 파일만).
+/ansible/patch-extra-packages.yml
+
+# ── dev 브랜치 전용 (이 블록은 dev 사본에만 있다) ─────────────────────────────
+# dev에서는 에이전트가 IaC 코드로 기능을 추가할 수 있다: modules/ · 2-1-dev/ ·
+# ansible/ 의 소유를 해제한다(마지막 매칭 우선 — 위의 *.tf, /ansible/,
+# /2-1-dev/env.auto.tfvars 소유를 이 라인들이 덮는다. env.auto.tfvars 포함 전체
+# 해제는 사용자 결정 2026-07-20). guard(plan + 비용 가드레일 + ansible syntax)는
+# 그대로 강제되고, prod 반영은 dev→main 승격 PR — main 사본의 CODEOWNERS가
+# 적용돼 사람 승인 필수다. .github/·scripts/·2-0-setup/·2-2-prod/는 dev에서도
+# 사람 소유 유지(파이프라인·부트스트랩·prod 정의는 에이전트 손 밖).
+/modules/
+/2-1-dev/
+/ansible/
+
+# 예외: 파라미터 스펙(ansible/specs/)은 dev에서도 사람 소유 — 파라미터 조치의
+# 입력 계약(키·타입·범위, 비용 한도 choices)은 dev 진입부터 사람이 승인한다
+# (2026-08-07). 마지막 매칭 우선이라 이 라인이 위 /ansible/ 해제를 덮는다.
+/ansible/specs/     @wo-o

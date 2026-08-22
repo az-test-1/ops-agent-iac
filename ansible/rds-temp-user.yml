@@ -1,0 +1,101 @@
+---
+# rds-temp-user.yml — RDS에 "만료 있는 임시 접근 유저"를 만든다(2-03 거버넌스).
+# dbadmin을 직접 공유하는 대신, bastion에서 psql로 RDS에 붙어 시간제한 role을
+# 발급한다. 만료는 postgres의 VALID UNTIL이 강제하고, role 정리는 state=absent로
+# 이 플레이북을 재실행해 DROP한다.
+#
+# 대상 환경은 워크플로가 --limit env_dev|env_prod 로 좁힌다(bastion 1대).
+#
+# 필수 extra-vars:
+#   db_host temp_user temp_password valid_until
+# 선택:
+#   db_name(기본 appdb) db_admin_user(기본 dbadmin) db_admin_password
+#   grant_mode: readonly|readwrite (기본 readonly)
+#   state: present|absent (기본 present. absent면 role DROP)
+- name: Provision or revoke a time-boxed temporary RDS user (via bastion)
+  hosts: role_bastion
+  gather_facts: false
+  vars:
+    db_name: appdb
+    db_admin_user: dbadmin
+    grant_mode: readonly
+    state: present
+  tasks:
+    - name: Require inputs
+      ansible.builtin.assert:
+        that:
+          - db_host is defined and (db_host | length) > 0
+          - temp_user is defined and (temp_user | length) > 0
+          - db_admin_password is defined and (db_admin_password | length) > 0
+        fail_msg: "db_host, temp_user, db_admin_password 는 필수 extra-var."
+
+    - name: Require create-only inputs
+      ansible.builtin.assert:
+        that:
+          - temp_password is defined and (temp_password | length) > 0
+          - valid_until is defined and (valid_until | length) > 0
+        fail_msg: "state=present면 temp_password, valid_until(ISO8601 UTC) 필수."
+      when: state == 'present'
+
+    - name: Ensure psql present
+      ansible.builtin.apt:
+        name: postgresql-client
+        state: present
+      become: true
+
+    - name: Create or update the temp role (time-boxed) + base grants
+      ansible.builtin.shell: |
+        set -euo pipefail
+        psql "host={{ db_host }} dbname={{ db_name }} user={{ db_admin_user }} sslmode=require" -v ON_ERROR_STOP=1 <<'SQL'
+        DO $$
+        BEGIN
+          IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{{ temp_user }}') THEN
+            ALTER ROLE "{{ temp_user }}" WITH LOGIN PASSWORD '{{ temp_password }}' VALID UNTIL '{{ valid_until }}';
+          ELSE
+            CREATE ROLE "{{ temp_user }}" WITH LOGIN PASSWORD '{{ temp_password }}' VALID UNTIL '{{ valid_until }}';
+          END IF;
+        END $$;
+        GRANT CONNECT ON DATABASE {{ db_name }} TO "{{ temp_user }}";
+        GRANT USAGE ON SCHEMA public TO "{{ temp_user }}";
+        {% if grant_mode == 'readwrite' %}
+        GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO "{{ temp_user }}";
+        ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO "{{ temp_user }}";
+        {% else %}
+        GRANT SELECT ON ALL TABLES IN SCHEMA public TO "{{ temp_user }}";
+        ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO "{{ temp_user }}";
+        {% endif %}
+        SQL
+      args:
+        executable: /bin/bash
+      environment:
+        PGPASSWORD: "{{ db_admin_password }}"
+      no_log: true
+      when: state == 'present'
+
+    - name: Revoke and drop the temp role (expiry)
+      ansible.builtin.shell: |
+        set -euo pipefail
+        CONN="host={{ db_host }} dbname={{ db_name }} user={{ db_admin_user }} sslmode=require"
+        # RDS 마스터(dbadmin)는 superuser가 아니라 temp role 멤버십이 없으면
+        # REASSIGN/DROP OWNED이 "permission denied to reassign objects"로 막힌다.
+        # 존재할 때만 멤버십을 부여받아 소유물 회수 후 DROP한다(멱등 — 이미 없으면 skip).
+        if [ "$(psql "$CONN" -tAc "SELECT 1 FROM pg_roles WHERE rolname = '{{ temp_user }}'")" = "1" ]; then
+          psql "$CONN" -v ON_ERROR_STOP=1 <<'SQL'
+        GRANT "{{ temp_user }}" TO {{ db_admin_user }};
+        REASSIGN OWNED BY "{{ temp_user }}" TO {{ db_admin_user }};
+        DROP OWNED BY "{{ temp_user }}";
+        DROP ROLE "{{ temp_user }}";
+        SQL
+        else
+          echo "role {{ temp_user }} not present — nothing to drop"
+        fi
+      args:
+        executable: /bin/bash
+      environment:
+        PGPASSWORD: "{{ db_admin_password }}"
+      no_log: true
+      when: state == 'absent'
+
+    - name: Report
+      ansible.builtin.debug:
+        msg: "temp user {{ temp_user }} state={{ state }} on {{ db_host }} ({{ grant_mode }}{{ ', valid until ' + valid_until if state == 'present' else '' }})"

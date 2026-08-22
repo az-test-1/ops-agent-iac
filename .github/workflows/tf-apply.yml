@@ -1,0 +1,244 @@
+name: tf-apply
+
+# 브랜치=환경 매핑: dev push는 2-1-dev를, main push는 2-2-prod를 apply한다
+# (존 전역 WAF는 2-2-prod 소유 — 구 2-4-waf 통합, 2026-07-20).
+# 3-1-pagerduty(PD 스케줄링)는 main 전용 추가 디렉터리 — 자기 경로 변경 push 또는
+# dispatch(target=3-1-pagerduty)로 apply한다 (PAGERDUTY_TOKEN repo secret 필요).
+# flat 레이아웃: path=<대상 디렉터리>. modules/ 변경은 서비스 디렉터리에만 — prod 반영은
+# dev→main 승격 머지로 한다. 반대편 환경 파일이 push에 섞이면(승격 머지에 dev 파일이
+# 따라오는 경우가 정상) 무시한다.
+on:
+  push:
+    branches: [main, dev]
+    paths:
+      - "2-1-dev/**"
+      - "2-2-prod/**"
+      - "3-1-pagerduty/**"
+      - "modules/**"
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "apply할 디렉터리 — 비우면 ref 브랜치의 서비스 디렉터리(dev=2-1-dev, main=2-2-prod·3-1-pagerduty 허용)"
+        type: string
+        required: false
+        default: ""
+      destructive:
+        description: "삭제성 apply 여부 — auto-merge가 service_enabled=false 전환 PR을 dispatch할 때 true로 넘긴다(approve-destroy 게이트). 사람 admin dispatch는 기본 false."
+        type: string
+        required: false
+        default: "false"
+
+# id-token: OIDC로 AWS apply role을 assume하기 위한 토큰 발급.
+# contents: checkout용 read. pull-requests: dflook이 PR에서 생성된 plan을 찾아 쓴다.
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+
+jobs:
+  detect:
+    name: 변경 감지
+    runs-on: ubuntu-latest
+    outputs:
+      targets: ${{ steps.detect.outputs.targets }}
+      destructive: ${{ steps.detect.outputs.destructive }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # push 전후(before..sha) diff에 두 커밋이 모두 필요하다 — shallow면 diff 실패.
+          fetch-depth: 0
+      - id: detect
+        env:
+          DISPATCH_TARGET: ${{ github.event.inputs.target }}
+          PD_TOKEN: ${{ secrets.PAGERDUTY_TOKEN }}
+        run: |
+          set -euo pipefail
+          to_json() { jq -R -s -c 'split("\n") | map(select(length>0))'; }
+          DESTRUCTIVE=false
+          # 브랜치가 대상 디렉터리 집합을 결정한다: dev=서비스(2-1-dev), main=서비스(2-2-prod).
+          # 존 전역 WAF는 2-2-prod 소유(구 2-4-waf 통합, 2026-07-20).
+          # 잘못된 브랜치에서의 dispatch는 stale 코드 apply foot-gun이라 거부.
+          # ALLOWED: dispatch로 지정 가능한 디렉터리 집합 — main은 PD 스케줄링 디렉터리도 포함.
+          case "${{ github.ref_name }}" in
+            dev)  SERVICE_ROOT="2-1-dev";  ALLOWED="2-1-dev" ;;
+            main) SERVICE_ROOT="2-2-prod"; ALLOWED="2-2-prod 3-1-pagerduty" ;;
+            *) echo "::error::지원하지 않는 브랜치 '${{ github.ref_name }}' (dev 또는 main)"; exit 1 ;;
+          esac
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TARGET="${DISPATCH_TARGET:-$SERVICE_ROOT}"
+            case " ${ALLOWED} " in
+              *" ${TARGET} "*) ;;
+              *)
+                echo "::error::target '$TARGET'은 이 브랜치(${{ github.ref_name }})에서 apply 불가 — 허용: ${ALLOWED}"
+                exit 1 ;;
+            esac
+            printf '%s\n' "$TARGET" | to_json > /tmp/targets
+            # 봇 머지 경로 게이트(2026-07-31 무승인 destroy 수정): auto-merge의
+            # GITHUB_TOKEN 머지는 push 이벤트를 억제해 apply를 dispatch로 돌린다 —
+            # 이 경로는 아래 push diff 감지를 타지 않으므로, 삭제성 여부는
+            # dispatcher(auto-merge)가 PR diff로 판정해 destructive 입력으로 넘긴다.
+            # 사람이 직접 돌리는 admin dispatch는 기본값 false로 게이트하지 않는다.
+            if [ "${{ github.event.inputs.destructive }}" = "true" ]; then
+              DESTRUCTIVE=true
+            fi
+          else
+            # 브랜치 신설 push는 before가 0이라 diff 불가 — apply할 것도 없다.
+            if [ "${{ github.event.before }}" = "0000000000000000000000000000000000000000" ]; then
+              FILES=""
+            else
+              FILES=$(git diff --name-only "${{ github.event.before }}" "${{ github.sha }}")
+            fi
+            roots=""
+            echo "$FILES" | grep -qE "^(${SERVICE_ROOT}|modules)/" && roots="$SERVICE_ROOT"
+            # PD 스케줄링 스택은 main 전용 — modules를 안 쓰므로 자기 경로에만 반응.
+            # PAGERDUTY_TOKEN 미등록이면 push 경로에서는 스킵(CF 토큰 게이트와 같은
+            # fail-quiet — PD 안 쓰는 리포에서 red run·Slack 노이즈 방지). dispatch는
+            # 게이트하지 않아 미등록 상태의 명시적 시도는 명확한 에러로 실패한다.
+            if [ "${{ github.ref_name }}" = "main" ] && echo "$FILES" | grep -q "^3-1-pagerduty/"; then
+              if [ -n "${PD_TOKEN:-}" ]; then
+                roots="$(printf '%s\n%s' "$roots" 3-1-pagerduty)"
+              else
+                echo "::notice::3-1-pagerduty 변경 감지 — PAGERDUTY_TOKEN 미등록이라 apply 스킵"
+              fi
+            fi
+            printf '%s\n' "$roots" | sed '/^$/d' | sort -u | to_json > /tmp/targets
+            # 삭제성 전환 감지: 서비스 surface에 service_enabled=false가 추가되는
+            # push는 plan에 EC2/RDS/Bastion/ALB destroy가 포함된다 — apply 전에
+            # destroy-approval 승인을 요구한다(approve-destroy 잡). 주석·문서 오탐을
+            # 막으려고 service.auto.tfvars의 추가 행만 본다. 이 diff 감지는 push
+            # 이벤트(사람 머지) 전용 — 봇 머지는 dispatch 경로의 destructive 입력이
+            # 담당한다(위 참고).
+            # grep -q 금지 — pipefail에서 grep 조기 종료가 git diff를 SIGPIPE(141)로
+            # 죽여 감지를 놓칠 수 있다. 전체 입력을 소비하도록 -q 없이 쓴다.
+            if [ -n "$FILES" ] && git diff "${{ github.event.before }}" "${{ github.sha }}" -- "${SERVICE_ROOT}/service.auto.tfvars" \
+                 | grep -E '^\+[[:space:]]*service_enabled[[:space:]]*=[[:space:]]*false' > /dev/null; then
+              DESTRUCTIVE=true
+            fi
+          fi
+          echo "targets=$(cat /tmp/targets)" >> "$GITHUB_OUTPUT"
+          echo "destructive=$DESTRUCTIVE" >> "$GITHUB_OUTPUT"
+          echo "detected: $(cat /tmp/targets) destructive=$DESTRUCTIVE"
+
+  # 삭제성 apply 게이트(2026-07-31): service_enabled=false 전환이 머지되면 apply 전에
+  # destroy-approval environment 승인을 요구한다 — tf-destroy와 같은 environment
+  # (required reviewer 설정: 2-0-setup/2-github/destroy_approval.sh). dev·prod 공통 —
+  # prod는 CODEOWNERS 사람 머지에 더해 이중 게이트가 된다. 거부하면 이 잡이 실패해
+  # apply가 스킵된다(단, false는 이미 머지돼 있으므로 revert 필요 — notify 참고).
+  approve-destroy:
+    name: 삭제 승인 대기 (destroy-approval)
+    runs-on: ubuntu-latest
+    needs: detect
+    if: needs.detect.outputs.targets != '[]' && needs.detect.outputs.destructive == 'true'
+    environment: destroy-approval
+    steps:
+      - run: echo "destroy-approval 승인됨 — 삭제성 apply를 진행한다."
+
+  apply:
+    name: apply (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    # approve-destroy는 삭제성 push에만 도는 잡 — 평시엔 skipped라 needs만 걸면 이
+    # 잡까지 같이 스킵된다. always()로 스킵 전파를 막고 result를 직접 검사한다
+    # (승인 거부·실패면 apply하지 않는다).
+    needs: [detect, approve-destroy]
+    if: >-
+      always() && needs.detect.outputs.targets != '[]' &&
+      (needs.approve-destroy.result == 'success' || needs.approve-destroy.result == 'skipped')
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJSON(needs.detect.outputs.targets) }}
+    # 같은 디렉터리(=같은 state)의 apply끼리 직렬화한다. tf-destroy도 같은 group을
+    # 쓰므로 한 state에 apply와 destroy가 동시에 붙는 일도 막힌다.
+    # cancel-in-progress: false — apply를 중간에 끊으면 state 유실·orphan 리소스가
+    # 남을 수 있어 절대 취소하지 않고 대기시킨다.
+    concurrency:
+      group: tf-${{ matrix.target }}-apply
+      cancel-in-progress: false
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION || 'ap-northeast-2' }}
+      PROJECT: ${{ vars.PROJECT_NAME || github.event.repository.name }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: session name 정리
+        id: sess
+        env:
+          TARGET: ${{ matrix.target }}
+        run: echo "name=tf-apply-$(printf '%s' "$TARGET" | tr '/' '-')" >> "$GITHUB_OUTPUT"
+
+      - name: AWS 자격증명 구성 (apply role, OIDC)
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/${{ env.PROJECT }}-apply
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: ${{ steps.sess.outputs.name }}
+
+      - name: terraform apply
+        uses: dflook/terraform-apply@v2
+        with:
+          path: ${{ matrix.target }}
+          label: ${{ matrix.target }}
+          # push(머지) 경로는 PR에서 생성된 plan을 그대로 apply한다(사람 검토 유지).
+          # workflow_dispatch(수동)는 관련 PR이 없어 plan을 못 가져오므로, 그 경우에만
+          # auto_approve로 plan을 즉석 생성해 apply한다(사람 검토 없는 admin 경로).
+          auto_approve: ${{ github.event_name == 'workflow_dispatch' }}
+          backend_config: |
+            bucket=${{ env.PROJECT }}-state-${{ secrets.AWS_ACCOUNT_ID }}
+            key=states/${{ matrix.target }}.tfstate
+            region=${{ env.AWS_REGION }}
+            use_lockfile=true
+          variables: |
+            project = "${{ env.PROJECT }}"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # provider 설정용(더미라도 있어야 plan/apply 시 provider가 configure된다).
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN != '' && secrets.CLOUDFLARE_API_TOKEN || '0000000000000000000000000000000000000000' }}
+          # 리소스 생성 게이트용: 토큰이 없으면 빈 값 → cloudflare 리소스 0(zone_id만
+          # 켜져 있어도 apply가 깨지지 않음, fail-closed). 실제 토큰이 있어야 반영.
+          TF_VAR_cloudflare_api_token: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          TF_VAR_db_password: ${{ secrets.DB_PASSWORD != '' && secrets.DB_PASSWORD || 'AppDemoPw2026!' }}
+          # 3-1-pagerduty 전용 — PD provider는 configure 시 토큰을 API로 검증하므로
+          # 더미 fallback 불가. secret 미등록이면 3-1 apply가 명시적으로 실패한다.
+          PAGERDUTY_TOKEN: ${{ secrets.PAGERDUTY_TOKEN }}
+          TF_VAR_oncall_user_email: ${{ vars.PD_ONCALL_EMAIL }}
+
+  # apply 실패는 "브랜치는 머지됐는데 클라우드는 그대로"인 드리프트를 남긴다(예: #83 —
+  # 한글 SG description으로 apply만 실패, 알림 없이 방치). 실패를 Slack으로 즉시 알려
+  # 사람이 원인 확인·재실행하게 한다. webhook 미설정이면 조용히 스킵.
+  notify-failure:
+    name: apply 실패 알림 (Slack)
+    runs-on: ubuntu-latest
+    needs: [detect, approve-destroy, apply]
+    # always()가 없으면 선행 잡 실패 시 이 잡 자체가 스킵된다 — "실패했을 때만
+    # 도는 잡"은 always()로 스킵을 막은 뒤 result를 직접 검사해야 한다.
+    # approve-destroy 거부도 알린다 — false가 이미 머지된 상태라 방치하면 다음
+    # push의 apply가 게이트 없이 destroy를 반영한다(전환 감지는 diff 기준).
+    if: always() && (needs.apply.result == 'failure' || needs.approve-destroy.result == 'failure')
+    steps:
+      - name: Slack에 실패 알림 (webhook 있으면)
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          MENTION: ${{ vars.INFRA_SLACK_MENTION || '@진' }}
+          TARGETS: ${{ needs.detect.outputs.targets }}
+          # 브랜치=환경이므로 알림도 실제 브랜치를 말해야 한다. "main은 머지됐지만"
+          # 하드코딩은 dev apply 실패에서 잘못된 입력이 되어 대응 에이전트를 오도한다.
+          BRANCH: ${{ github.ref_name }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          APPROVE_RESULT: ${{ needs.approve-destroy.result }}
+        run: |
+          set -euo pipefail
+          if [ -z "${SLACK_WEBHOOK_URL:-}" ]; then
+            echo "SLACK_WEBHOOK_URL 미설정 — 실패 알림 스킵."
+            exit 0
+          fi
+          if [ "$APPROVE_RESULT" = "failure" ]; then
+            # 승인 거부는 apply만 막는다 — service_enabled=false는 이미 머지돼 있어
+            # 그대로 두면 다음 push의 apply가 승인 없이 destroy를 반영한다.
+            text="${MENTION} :no_entry: *삭제 승인 거부/실패* (\`${TARGETS}\`) — \`${BRANCH}\` 브랜치에는 service_enabled=false가 이미 머지돼 있습니다. 삭제 의사가 없으면 해당 머지를 git revert 해야 다음 push에서 의도치 않은 destroy가 나가지 않습니다: ${RUN_URL}"
+          else
+            text="${MENTION} :x: *tf-apply 실패* (\`${TARGETS}\`) — \`${BRANCH}\` 브랜치는 반영됐지만 apply가 실패해 코드와 클라우드 상태가 어긋나 있습니다(드리프트). 원인 확인·재실행: ${RUN_URL}"
+          fi
+          jq -nc --arg t "$text" '{text:$t}' | \
+            curl -sS -X POST -H 'Content-Type: application/json' -d @- "$SLACK_WEBHOOK_URL"
+          echo "Slack 실패 알림 전송됨."

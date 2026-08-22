@@ -1,0 +1,143 @@
+---
+# monitoring-agents.yml — app 플릿에 node_exporter(:9100) + promtail 설치·기동.
+#
+# 2-0-setup의 공유 모니터링 서버와의 계약(monitoring.tf):
+#   - 메트릭: Prometheus가 ec2_sd로 tag:Name=<project>-*-app-* 인스턴스의 :9100을
+#            scrape한다(job=node). node_exporter가 CPU/메모리/디스크(/data)/inode 메트릭을
+#            노출하면 alert 룰(CPU/메모리/디스크/inode/up)이 그대로 발화한다.
+#            app EC2 SG는 이미 모니터링 서버 SG에서 오는 :9100 인그레스를 연다(main.tf).
+#   - 로그: promtail이 앱 로그(/var/log/app/app.log)를 모니터링 서버의 Loki
+#          (고정 private IP 10.42.0.10:3100)로 push한다. Grafana "app logs" 패널이
+#          쓰는 스트림 라벨 job=app 을 붙인다.
+#
+# 실행 시점: 2-3-incident-response 실습 시작 시 1회(사전 준비). 초기 서비스 세팅
+# (user_data)에는 포함되지 않는다 — 설치 전에는 알람 소스(metric/log)가 없어
+# 2-3의 alert 룰이 발화하지 않는 것이 정상이다. 모니터링 서버 자체는 2-0-setup이 띄운다.
+# 멱등: 이미 설치·구동 중이면 변화 없음. self-hosted gha-runner(ansible-ops.yml)나
+# 수강생 Mac에서 실행한다:  cd ansible && ansible-playbook monitoring-agents.yml
+#
+# 참고: 이 모델에는 nginx가 없으므로(ALB→앱 :8080 직결) 모니터링 서버의
+# nginx 5xx/401 로그 알람({job="nginx"})은 소스가 없다 — 앱의 500은 CPU 스파이크와
+# app.log의 ERROR 라인으로 관측된다(2-07 드릴). 로그 기반 5xx 감지가 필요하면
+# 모니터링 서버 룰을 app 로그 기반으로 바꾸는 건 2-0-setup(terraform)의 몫이다.
+- name: Install node_exporter + promtail on the app fleet
+  hosts: "role_app"
+  become: true
+  vars:
+    # 모니터링 서버 private IP는 설계상 고정이다(VPC 10.42.0.0/16, public subnet
+    # cidrhost(...,10) = 10.42.0.10 — README '공유 모니터링 스택'). 인스턴스를
+    # 재구축해도 유지되므로 하드코딩해도 안전하다. 필요하면 -e loki_url=... 로 덮는다.
+    loki_url: "http://10.42.0.10:3100/loki/api/v1/push"
+    # 모니터링 스택 이미지(grafana/promtail:3.4.1)와 버전을 맞춘다.
+    promtail_version: "3.4.1"
+    app_log_path: "/var/log/app/app.log"
+    promtail_positions: /var/lib/promtail/positions.yaml
+
+  tasks:
+    # --- node_exporter (:9100) — Prometheus ec2_sd 대상 ------------------------
+    - name: Install node_exporter (apt)
+      ansible.builtin.apt:
+        name: prometheus-node-exporter
+        state: present
+        update_cache: true
+
+    - name: Ensure node_exporter enabled and running (:9100)
+      ansible.builtin.systemd:
+        name: prometheus-node-exporter
+        enabled: true
+        state: started
+
+    # --- promtail — apt 패키지가 없어 공식 릴리스 바이너리를 설치한다 ------------
+    - name: Install unzip (promtail zip 해제용)
+      ansible.builtin.apt:
+        name: unzip
+        state: present
+
+    - name: Check promtail binary
+      ansible.builtin.stat:
+        path: /usr/local/bin/promtail
+      register: promtail_bin
+
+    - name: Download and extract promtail {{ promtail_version }}
+      ansible.builtin.unarchive:
+        src: "https://github.com/grafana/loki/releases/download/v{{ promtail_version }}/promtail-linux-amd64.zip"
+        dest: /usr/local/bin
+        remote_src: true
+        creates: /usr/local/bin/promtail-linux-amd64
+      when: not promtail_bin.stat.exists
+
+    - name: Put promtail on PATH as /usr/local/bin/promtail
+      ansible.builtin.command:
+        cmd: mv /usr/local/bin/promtail-linux-amd64 /usr/local/bin/promtail
+        creates: /usr/local/bin/promtail
+      when: not promtail_bin.stat.exists
+
+    - name: promtail binary perms
+      ansible.builtin.file:
+        path: /usr/local/bin/promtail
+        mode: "0755"
+        owner: root
+        group: root
+
+    - name: promtail dirs (config + positions)
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0755"
+      loop:
+        - /etc/promtail
+        - /var/lib/promtail
+
+    - name: promtail config
+      ansible.builtin.copy:
+        dest: /etc/promtail/config.yml
+        mode: "0644"
+        content: |
+          server:
+            http_listen_port: 9080
+            grpc_listen_port: 0
+          positions:
+            filename: {{ promtail_positions }}
+          clients:
+            - url: {{ loki_url }}
+          scrape_configs:
+            - job_name: app
+              static_configs:
+                - targets: [localhost]
+                  labels:
+                    job: app
+                    host: "{{ tags.Name | default(ansible_facts['hostname']) }}"
+                    service: "{{ tags.Service | default('') }}"
+                    __path__: {{ app_log_path }}
+      notify: restart promtail
+
+    - name: promtail systemd unit
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/promtail.service
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Promtail (ships app logs to the shared Loki)
+          After=network-online.target
+          Wants=network-online.target
+          [Service]
+          ExecStart=/usr/local/bin/promtail -config.file=/etc/promtail/config.yml
+          Restart=always
+          RestartSec=5
+          [Install]
+          WantedBy=multi-user.target
+      notify: restart promtail
+
+    - name: Ensure promtail enabled and running
+      ansible.builtin.systemd:
+        name: promtail
+        enabled: true
+        state: started
+        daemon_reload: true
+
+  handlers:
+    - name: restart promtail
+      ansible.builtin.systemd:
+        name: promtail
+        state: restarted
+        daemon_reload: true

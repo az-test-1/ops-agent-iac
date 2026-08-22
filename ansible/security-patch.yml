@@ -1,0 +1,42 @@
+---
+# security-patch.yml — app 서버(앱 + bastion) 보안 패치.
+# unattended 방식으로 보안 업데이트만 적용하고, 커널 등으로 재부팅이 필요하면
+# 무중단을 위해 한 대씩(serial: 1) 재부팅한다.
+- name: Apply security patches to app hosts
+  hosts: "role_app:role_bastion"
+  become: true
+  serial: 1
+  # 추가 설치 패키지 목록(surface). prod 플러그인이 편집한다. 기본 빈 목록.
+  vars_files:
+    - patch-extra-packages.yml
+  tasks:
+    - name: Update apt cache
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 0
+
+    - name: Upgrade security packages only
+      ansible.builtin.apt:
+        upgrade: dist
+        autoremove: true
+      register: patched
+
+    - name: Install requested extra packages (patch surface)
+      ansible.builtin.apt:
+        name: "{{ extra_packages }}"
+        state: present
+      when: extra_packages is defined and (extra_packages | length) > 0
+      register: extra_installed
+
+    - name: Check if reboot is required
+      ansible.builtin.stat:
+        path: /var/run/reboot-required
+      register: reboot_required
+
+    - name: Reboot if the kernel/libs require it (one host at a time)
+      ansible.builtin.reboot:
+        reboot_timeout: 300
+      when: reboot_required.stat.exists
+
+    - ansible.builtin.debug:
+        msg: "patched={{ patched.changed }} rebooted={{ reboot_required.stat.exists }} extra_pkgs={{ extra_packages | default([]) | length }}"

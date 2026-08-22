@@ -1,0 +1,288 @@
+name: tf-plan
+
+# PR 흐름: 변경 감지 → plan → guard 게이트.
+# 값 경계는 각 디렉터리/모듈의 terraform variable validation이 강제한다(잘못된 값이면
+# plan 실패). 브랜치=환경 매핑: dev 브랜치로의 PR은 2-1-dev만, main으로의 PR은
+# 2-2-prod만 plan한다(modules/ 변경 포함). 반대편 환경 파일이 섞인 PR(승격 머지
+# dev→main에 dev 파일이 따라오는 경우)은 그 부분을 무시한다 — apply도 같은 규칙.
+# 2-0-setup은 사람 로컬 bootstrap이라 CI에서 안 돈다(CODEOWNERS 보호).
+on:
+  # paths 필터를 걸지 않는다 — guard가 main·dev 룰셋의 required check라서, 어떤 PR이든
+  # 이 워크플로가 실행돼 guard가 결과를 보고해야 한다. 필터 때문에 워크플로 자체가
+  # 안 돌면 check가 생성되지 않아 "Expected — Waiting"으로 영원히 대기하고 머지가
+  # 막힌다(docs-only PR, diff 0인 PR 포함). 변경 디렉터리 판별은 어차피 detect job이
+  # git diff로 한다 — 해당 디렉터리가 없으면 plan은 skip되고 guard는 통과를 보고한다.
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "plan할 디렉터리 (2-1-dev / 2-2-prod / 3-1-pagerduty, 전체는 all)"
+        type: string
+        required: true
+        default: all
+
+# id-token: OIDC로 AWS plan role을 assume하기 위한 토큰 발급.
+# contents: checkout용 read. pull-requests: dflook이 plan 결과를 PR 코멘트로 단다.
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+
+jobs:
+  detect:
+    name: 변경 감지
+    runs-on: ubuntu-latest
+    outputs:
+      targets: ${{ steps.detect.outputs.targets }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # base..head diff에 두 커밋이 모두 로컬에 있어야 한다 — shallow면 diff 실패.
+          fetch-depth: 0
+      - id: detect
+        env:
+          DISPATCH_TARGET: ${{ github.event.inputs.target }}
+          PD_TOKEN: ${{ secrets.PAGERDUTY_TOKEN }}
+        run: |
+          set -euo pipefail
+          # 줄 단위 디렉터리 목록 → JSON 배열. plan 잡의 matrix 입력이 된다.
+          to_json() { jq -R -s -c 'split("\n") | map(select(length>0))'; }
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            if [ "$DISPATCH_TARGET" = "all" ]; then
+              { echo "2-1-dev"; echo "2-2-prod"; } | to_json
+            else
+              printf '%s\n' "$DISPATCH_TARGET" | to_json
+            fi > /tmp/targets
+          else
+            # base 브랜치가 대상 디렉터리 집합을 결정한다: dev=2-1-dev, main=2-2-prod.
+            # 존 전역 WAF는 2-2-prod 소유(구 2-4-waf 통합, 2026-07-20).
+            # 그 외 base로의 PR은 plan 대상이 없다(guard는 통과 보고).
+            case "${{ github.event.pull_request.base.ref }}" in
+              dev)  SERVICE_ROOT="2-1-dev" ;;
+              main) SERVICE_ROOT="2-2-prod" ;;
+              *)    SERVICE_ROOT="" ;;
+            esac
+            BASE="${{ github.event.pull_request.base.sha }}"
+            HEAD="${{ github.event.pull_request.head.sha }}"
+            FILES=$(git diff --name-only "$BASE" "$HEAD")
+            roots=""
+            if [ -n "$SERVICE_ROOT" ] && echo "$FILES" | grep -qE "^(${SERVICE_ROOT}|modules)/"; then
+              roots="$SERVICE_ROOT"
+            fi
+            # PD 스케줄링 스택은 main 전용 CI 디렉터리 — modules를 안 쓰므로 자기 경로에만 반응.
+            # PAGERDUTY_TOKEN 미등록이면 스킵(tf-apply의 push 게이트와 동일한 fail-quiet —
+            # PD provider는 토큰 없이 plan 자체가 불가). dispatch는 게이트하지 않는다.
+            if [ "${{ github.event.pull_request.base.ref }}" = "main" ] && echo "$FILES" | grep -q "^3-1-pagerduty/"; then
+              if [ -n "${PD_TOKEN:-}" ]; then
+                roots="$(printf '%s\n%s' "$roots" 3-1-pagerduty)"
+              else
+                echo "::notice::3-1-pagerduty 변경 감지 — PAGERDUTY_TOKEN 미등록이라 plan 스킵"
+              fi
+            fi
+            printf '%s\n' "$roots" | sed '/^$/d' | sort -u | to_json > /tmp/targets
+          fi
+          echo "targets=$(cat /tmp/targets)" >> "$GITHUB_OUTPUT"
+          echo "detected: $(cat /tmp/targets)"
+
+      # prod 원본 grant 파일은 CODEOWNERS 소유로 유지하고, 만료 스위퍼만 별도의
+      # ownerless revocation 파일을 쓴다. detect가 이미 checkout한 diff를 재사용해
+      # 봇 정체성·단일 파일 범위·현재 만료 fingerprint를 guard 전에 검증한다.
+      - name: prod expiry revocation 검증
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          target="2-2-prod/access-expiry.auto.tfvars.json"
+          files=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA")
+          if ! echo "$files" | grep -Fqx "$target"; then
+            echo "prod expiry revocation 변경 없음 — skip"
+            exit 0
+          fi
+          if [ "$BASE_REF" != "main" ] ||
+             [ "$HEAD_REF" != "ops/access-expiry-prod" ] ||
+             [[ "$PR_AUTHOR" != *"[bot]" ]] ||
+             [ "$files" != "$target" ]; then
+            echo "::error::prod expiry는 ops/access-expiry-prod 봇의 단일 revocation 파일 PR만 허용한다."
+            exit 1
+          fi
+          python3 scripts/validate_access_expiry.py
+
+  plan:
+    name: plan (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    needs: detect
+    # detect가 빈 배열을 내면(대상 디렉터리 변경 없음) plan 전체를 스킵한다 —
+    # guard는 skipped를 통과로 취급한다.
+    if: needs.detect.outputs.targets != '[]'
+    strategy:
+      # 한 디렉터리의 plan 실패가 다른 디렉터리의 plan을 취소하지 않게 한다 —
+      # 실패 원인 파악에는 나머지 결과도 필요하다.
+      fail-fast: false
+      matrix:
+        target: ${{ fromJSON(needs.detect.outputs.targets) }}
+    # 같은 디렉터리의 plan끼리 직렬화 — 연속 push로 두 실행이 겹치면 같은 state를
+    # 동시에 읽으며 lock 경합으로 불필요하게 실패할 수 있다.
+    concurrency:
+      group: tf-${{ matrix.target }}-plan
+      cancel-in-progress: false
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION || 'ap-northeast-2' }}
+      PROJECT: ${{ vars.PROJECT_NAME || github.event.repository.name }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      # grow-only 가드레일: EC2 데이터 볼륨 축소=데이터 유실이라 거부(base와 비교).
+      - name: grow-only 검사 (disk 볼륨 축소 거부)
+        if: (matrix.target == '2-1-dev' || matrix.target == '2-2-prod') && github.event_name == 'pull_request'
+        run: |
+          f=${{ matrix.target }}/disk.auto.tfvars
+          [ -f "$f" ] || exit 0
+          num() { grep -oE 'data_volume_size_gb[[:space:]]*=[[:space:]]*[0-9]+' | grep -oE '[0-9]+$'; }
+          new=$(num < "$f" || true)
+          old=$(git show "${{ github.event.pull_request.base.sha }}:$f" 2>/dev/null | num || true)
+          echo "base=${old:-none} pr=${new:-none}"
+          if [ -n "$old" ] && [ -n "$new" ] && [ "$new" -lt "$old" ]; then
+            echo "::error::grow-only 위반: data_volume_size_gb ${new} < 현재 ${old} (축소=데이터 유실)."
+            exit 1
+          fi
+
+      # 비용 가드레일: dev 브랜치는 에이전트가 .tf(validation 포함)를 수정할 수 있으므로,
+      # 인스턴스 타입 상한을 에이전트가 못 건드리는 이 워크플로에서 한 번 더 검사한다.
+      # variables.tf validation이 1차, 이 스텝이 독립 2차 — t3.micro/small ·
+      # db.t3.micro/small 외의 타입 리터럴이 target 디렉터리나 modules/에 보이면 거부한다.
+      # 주석 라인은 제외. (전면 정책 엔진은 랩 범위 밖 — 인스턴스 타입만 잡는다.)
+      - name: 비용 가드레일 (인스턴스 타입 allowlist)
+        if: matrix.target == '2-1-dev' || matrix.target == '2-2-prod'
+        run: |
+          set -euo pipefail
+          bad=$(find "${{ matrix.target }}" modules -type f \
+              \( -name '*.tf' -o -name '*.tfvars' -o -name '*.tfvars.json' \) \
+              -exec cat {} + \
+            | sed -e 's/#.*//' -e 's|//.*||' \
+            | grep -oE '\b(db\.)?[a-z][a-z0-9]{1,3}\.(nano|micro|small|medium|large|[0-9]*xlarge|metal)\b' \
+            | sort -u | grep -vxE 't3\.(micro|small)|db\.t3\.(micro|small)' || true)
+          if [ -n "$bad" ]; then
+            echo "::error::비용 가드레일: 허용 밖 인스턴스 타입 발견 — $(echo "$bad" | tr '\n' ' '). 허용: t3.micro t3.small db.t3.micro db.t3.small"
+            exit 1
+          fi
+          echo "비용 가드레일 통과 (허용 밖 인스턴스 타입 없음)"
+
+      - name: session name 정리
+        id: sess
+        env:
+          TARGET: ${{ matrix.target }}
+        run: echo "name=tf-plan-$(printf '%s' "$TARGET" | tr '/' '-')" >> "$GITHUB_OUTPUT"
+
+      - name: AWS 자격증명 구성 (plan role, OIDC)
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/${{ env.PROJECT }}-plan
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: ${{ steps.sess.outputs.name }}
+
+      - name: terraform plan
+        uses: dflook/terraform-plan@v2
+        with:
+          path: ${{ matrix.target }}
+          label: ${{ matrix.target }}
+          add_github_comment: true
+          # state는 S3 버킷 하나에 디렉터리별 key로 분리 — 환경끼리 state가 안 섞인다.
+          # use_lockfile: S3 조건부 쓰기 기반 잠금(별도 DynamoDB 테이블 불필요).
+          backend_config: |
+            bucket=${{ env.PROJECT }}-state-${{ secrets.AWS_ACCOUNT_ID }}
+            key=states/${{ matrix.target }}.tfstate
+            region=${{ env.AWS_REGION }}
+            use_lockfile=true
+          variables: |
+            project = "${{ env.PROJECT }}"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # provider 설정용(더미라도 있어야 provider가 configure된다).
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN != '' && secrets.CLOUDFLARE_API_TOKEN || '0000000000000000000000000000000000000000' }}
+          # 리소스 생성 게이트용: 없으면 빈 값 → cloudflare 리소스 0(fail-closed).
+          TF_VAR_cloudflare_api_token: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          TF_VAR_db_password: ${{ secrets.DB_PASSWORD != '' && secrets.DB_PASSWORD || 'AppDemoPw2026!' }}
+          # 3-1-pagerduty 전용 — PD provider는 configure 시 토큰을 API로 검증하므로
+          # 더미 fallback이 불가능하다. secret 미등록 상태로 3-1을 건드리면 plan이
+          # 명시적으로 실패한다(fail-closed). 다른 디렉터리는 이 값을 읽지 않는다.
+          PAGERDUTY_TOKEN: ${{ secrets.PAGERDUTY_TOKEN }}
+          TF_VAR_oncall_user_email: ${{ vars.PD_ONCALL_EMAIL }}
+
+  # dev 브랜치는 에이전트가 ansible/ 플레이북을 수정할 수 있다(dev CODEOWNERS 무소유).
+  # ansible은 terraform plan을 안 거치므로, 문법 깨진 플레이북이 그대로 머지돼
+  # dispatch 시점에야 터지는 것을 막기 위해 PR 단계에서 syntax-check를 돈다.
+  ansible-syntax:
+    name: ansible syntax check
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: 변경된 플레이북 syntax-check
+        run: |
+          set -euo pipefail
+          BASE="${{ github.event.pull_request.base.sha }}"
+          HEAD="${{ github.event.pull_request.head.sha }}"
+          # vars 파일(patch-extra-packages.yml)·등록부(playbooks.yml)·스펙(specs/)·
+          # inventory·cfg는 플레이북이 아니라 --syntax-check 대상에서 뺀다.
+          # --diff-filter=ACMR: 삭제(D) 파일은 HEAD에 없어 --syntax-check가 "파일 없음"으로
+          # 실패한다 — 플레이북 삭제 PR이 막히던 버그. 삭제 파일은 검사 대상에서 뺀다.
+          books=$(git diff --name-only --diff-filter=ACMR "$BASE" "$HEAD" \
+            | grep -E '^ansible/.*\.yml$' \
+            | grep -vE '^ansible/(patch-extra-packages\.yml|playbooks\.yml|specs/|inventory/)' || true)
+          if [ -z "$books" ]; then
+            echo "변경된 플레이북 없음 — skip"
+            exit 0
+          fi
+          pip install --quiet ansible-core
+          # repo 루트에서 실행 — ansible/ansible.cfg(aws_ec2 동적 인벤토리)를 로드하지
+          # 않도록 정적 더미 인벤토리를 준다. syntax-check는 파싱만 한다.
+          for b in $books; do
+            echo "── syntax-check: $b"
+            ansible-playbook -i localhost, --syntax-check "$b"
+          done
+
+  # guard는 main·dev 룰셋의 required check — 이 잡의 결론 하나로 머지 가부가 결정된다.
+  # plan(디렉터리별 matrix)이 몇 개 돌든 check 이름은 guard 하나로 고정되어,
+  # 룰셋 설정이 matrix 구성에 안 끌려간다.
+  guard:
+    name: guard
+    runs-on: ubuntu-latest
+    needs: [detect, plan, ansible-syntax]
+    # 기본값이면 선행 잡이 실패/스킵될 때 guard 자체가 스킵돼 check 결론이 안 남고,
+    # required check 대기 상태로 머지가 영원히 막힌다. 항상 떠서 결론을 보고해야 한다.
+    if: always()
+    steps:
+      - name: plan 결과 확인
+        run: |
+          # detect가 실패하면 plan은 'skipped'가 된다 — skipped를 성공으로 취급하는
+          # 아래 분기만 있으면 detect 실패가 초록불이 되므로(fail-open) 먼저 막는다.
+          detect="${{ needs.detect.result }}"
+          if [ "$detect" != "success" ]; then
+            echo "::error::detect 실패($detect) — 변경 디렉터리를 판별하지 못했다. PR을 막는다."
+            exit 1
+          fi
+          result="${{ needs.plan.result }}"
+          if [ "$result" = "success" ] || [ "$result" = "skipped" ]; then
+            echo "plan ok ($result)"
+          else
+            echo "::error::plan 실패 — terraform validation 위반 가능. PR을 막는다."
+            exit 1
+          fi
+          # ansible-syntax는 pull_request에서만 돈다(dispatch면 skipped=통과).
+          asyn="${{ needs['ansible-syntax'].result }}"
+          if [ "$asyn" = "success" ] || [ "$asyn" = "skipped" ]; then
+            echo "ansible-syntax ok ($asyn)"
+          else
+            echo "::error::ansible syntax check 실패 — 플레이북 파싱 불가. PR을 막는다."
+            exit 1
+          fi

@@ -1,0 +1,30 @@
+# rds-temp-user 파라미터 스펙 — 사람 소유(CODEOWNERS, dev 브랜치 포함).
+#
+# temp_user·valid_until은 bastion psql SQL로 보간되는 값이라 앵커된 패턴으로
+# 자유 문자열을 봉쇄한다. temp_password는 dispatch 주체(플러그인)가 생성해
+# 넘기는 자격증명 — secret: true는 엔진이 run 로그에서 마스킹하는 표시이고,
+# generated: true는 플러그인이 값을 만들어 요청 응답으로 전달하는 표시다.
+# state=absent(DROP)·grant_mode 생략 시 기본값은 플레이북 vars가 갖는다.
+#
+# derived: 러너에서만 알 수 있는 값 — 엔진 provider가 조회해 주입한다
+# (db_host = 해당 env RDS 엔드포인트, db_admin_password = GHA secret).
+params:
+  - name: temp_user
+    type: string
+    pattern: "^[a-z][a-z0-9_]{2,30}$"
+    required: true
+  - name: valid_until
+    type: string
+    pattern: "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z$"
+  - name: grant_mode
+    type: choice
+    choices: [readonly, readwrite]
+  - name: state
+    type: choice
+    choices: [present, absent]
+  - name: temp_password
+    type: string
+    pattern: "^[A-Za-z0-9]{16,64}$"
+    secret: true
+    generated: true
+derived: [db_host, db_admin_password]
