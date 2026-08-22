@@ -1,0 +1,18 @@
+# systemd unit for the policy approver (Day 3 advanced lab).
+# Install on the monitoring host:
+#   sudo cp policy-approver.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now policy-approver
+[Unit]
+Description=policy approver - auto-approve verified incident PRs
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=ec2-user
+EnvironmentFile=/etc/policy-approver.env
+ExecStart=/usr/bin/python3 /opt/policy-approver/policy_approver.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

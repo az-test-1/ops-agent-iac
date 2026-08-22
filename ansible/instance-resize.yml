@@ -1,0 +1,110 @@
+---
+# instance-resize.yml — ALB 뒷단 app 인스턴스 타입을 무중단 지향으로 변경(롤링).
+#
+# terraform으로 ec2_instance_type을 바꾸면 두 인스턴스가 병렬로 in-place stop/start
+# 되어 동시에 정지한다(순단). 이 플레이북은 TG에서 빼고(연결 드레인) → stop →
+# 타입 변경 → start → TG 복귀·healthy 대기를 serial: 1로 한 대씩 수행한다.
+# 한 대가 healthy로 복귀하지 못하면 플레이가 중단되어 나머지는 건드리지 않는다.
+#
+# 실행 후 반드시 해당 env tfvars의 ec2_instance_type을 같은 값으로 맞추는 PR을
+# 머지해야 한다 — 실제 타입이 이미 새 값이라 plan은 no-op. 생략하면 다음 apply가
+# 두 대를 동시에 구 타입으로 되돌린다(순단 재발).
+#
+# 모든 조작은 러너 localhost의 aws CLI로 수행한다(stop 중엔 대상 SSH 불가 —
+# gather_facts: false로 SSH 자체를 열지 않는다). 앱 healthy 판정은 TG health
+# check(wait target-in-service)가 담당한다 — 러너 SG에는 app :8080 인바운드가
+# 없어 직접 /healthz 확인이 불가능하고, 서빙 복귀 기준은 ALB 판정이 정본이다.
+- name: Rolling instance type change of the app fleet behind the ALB
+  hosts: role_app
+  gather_facts: false
+  serial: 1
+  vars:
+    project: "{{ lookup('env', 'PROJECT') | default('ops-agent-iac', true) }}"
+    region: "{{ lookup('env', 'AWS_REGION') | default('ap-northeast-2', true) }}"
+    instance_type: "" # -e @extra-vars.json (specs/instance-resize.yml 스펙 검증 통과 값)
+  tasks:
+    # 비용 상한 allowlist — modules/service/variables.tf의 validation과 같은 목록.
+    # 이 경로는 tfvars validation·tf-plan cost guard를 거치지 않으므로 여기서 봉쇄.
+    - name: Validate target type against the cost-cap allowlist
+      ansible.builtin.assert:
+        that: instance_type in ['t3.micro', 't3.small']
+        fail_msg: "instance_type은 t3.micro 또는 t3.small이어야 한다(비용 상한 — variables.tf와 동일)."
+
+    - name: Read the current instance type
+      delegate_to: localhost
+      ansible.builtin.command: >
+        aws ec2 describe-instances --region {{ region }}
+        --instance-ids {{ instance_id }}
+        --query Reservations[0].Instances[0].InstanceType --output text
+      register: current_type
+      changed_when: false
+      check_mode: false # read-only 조회 — dry_run(--check)에서도 멱등 판정에 필요
+
+    - name: Skip this host when already at the target type
+      ansible.builtin.meta: end_host
+      when: current_type.stdout == instance_type
+
+    - name: Resolve this environment's target group ARN
+      delegate_to: localhost
+      ansible.builtin.command: >
+        aws elbv2 describe-target-groups --region {{ region }}
+        --names {{ project }}-{{ tags.Environment | default('dev') }}-tg
+        --query TargetGroups[0].TargetGroupArn --output text
+      register: tg_arn
+      changed_when: false
+      check_mode: false
+
+    - name: Deregister from the target group (drain)
+      delegate_to: localhost
+      ansible.builtin.command: >
+        aws elbv2 deregister-targets --region {{ region }}
+        --target-group-arn {{ tg_arn.stdout }} --targets Id={{ instance_id }}
+
+    - name: Wait for connection draining to complete
+      delegate_to: localhost
+      ansible.builtin.command: >
+        aws elbv2 wait target-deregistered --region {{ region }}
+        --target-group-arn {{ tg_arn.stdout }} --targets Id={{ instance_id }}
+
+    - name: Stop the instance
+      delegate_to: localhost
+      ansible.builtin.command: >
+        aws ec2 stop-instances --region {{ region }} --instance-ids {{ instance_id }}
+
+    - name: Wait until stopped
+      delegate_to: localhost
+      ansible.builtin.command: >
+        aws ec2 wait instance-stopped --region {{ region }} --instance-ids {{ instance_id }}
+
+    - name: Change the instance type
+      delegate_to: localhost
+      ansible.builtin.command: >
+        aws ec2 modify-instance-attribute --region {{ region }}
+        --instance-id {{ instance_id }} --instance-type Value={{ instance_type }}
+
+    - name: Start the instance
+      delegate_to: localhost
+      ansible.builtin.command: >
+        aws ec2 start-instances --region {{ region }} --instance-ids {{ instance_id }}
+
+    - name: Wait until running
+      delegate_to: localhost
+      ansible.builtin.command: >
+        aws ec2 wait instance-running --region {{ region }} --instance-ids {{ instance_id }}
+
+    - name: Register back to the target group
+      delegate_to: localhost
+      ansible.builtin.command: >
+        aws elbv2 register-targets --region {{ region }}
+        --target-group-arn {{ tg_arn.stdout }} --targets Id={{ instance_id }}
+
+    # 앱 부팅(systemd app.service 자동 기동) + ALB health check 통과까지 대기.
+    # 이 게이트가 실패하면 플레이 중단 — 다음 인스턴스는 원래 타입으로 서빙 유지.
+    - name: Wait until healthy in the target group
+      delegate_to: localhost
+      ansible.builtin.command: >
+        aws elbv2 wait target-in-service --region {{ region }}
+        --target-group-arn {{ tg_arn.stdout }} --targets Id={{ instance_id }}
+
+    - ansible.builtin.debug:
+        msg: "resized {{ inventory_hostname }} ({{ instance_id }}) → {{ instance_type }} — drained → stop/modify/start → healthy"

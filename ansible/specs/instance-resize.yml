@@ -1,0 +1,11 @@
+# instance-resize 파라미터 스펙 — 사람 소유(CODEOWNERS, dev 브랜치 포함).
+#
+# ansible-ops.yml의 generic 검증 엔진과 플러그인이 이 스펙을 읽어 dispatch
+# 파라미터를 검증한다. 여기 선언되지 않은 키·범위 밖 값은 실행 전에 거부된다.
+# choices는 비용 상한 allowlist — modules/service/variables.tf validation과 동일
+# 목록. 이 파일이 사람 소유라 에이전트는 허용 타입을 스스로 넓힐 수 없다.
+params:
+  - name: instance_type
+    type: choice
+    choices: [t3.micro, t3.small]
+    required: true

@@ -1,0 +1,53 @@
+---
+# disk-grow.yml — EC2 데이터 볼륨(/data) 라이브 파일시스템 확장.
+# terraform이 EBS 볼륨 size를 이미 키운 뒤(교체 없음), 이 플레이북이 실행 중인
+# 앱 서버에 SSH로 붙어 growpart(있으면) + resize2fs로 /data를 새 블록 크기까지
+# 늘린다. 멱등: 이미 풀사이즈면 아무것도 안 바뀐다.
+- name: Grow /data filesystem on app
+  hosts: "role_app"
+  become: true
+  tasks:
+    - name: Find the device backing /data
+      ansible.builtin.shell: findmnt -no SOURCE /data
+      register: data_src
+      changed_when: false
+      failed_when: data_src.rc != 0
+      check_mode: false # read-only 조회 — dry_run(--check)에서도 실행돼야 뒤 태스크가 값을 쓴다
+
+    - name: Resolve parent disk + partition (if any)
+      ansible.builtin.shell: |
+        SRC="{{ data_src.stdout }}"
+        PK=$(lsblk -no PKNAME "$SRC" | head -1)
+        if [ -n "$PK" ]; then
+          PART=$(basename "$SRC" | grep -oE '[0-9]+$' || true)
+          echo "/dev/$PK $PART"
+        else
+          echo "$SRC "
+        fi
+      register: disk_info
+      changed_when: false
+      check_mode: false # read-only 조회 — growpart/resize2fs가 이 값을 쓴다
+
+    - name: growpart (partitioned disks only; NOCHANGE tolerated)
+      ansible.builtin.shell: >
+        growpart {{ (disk_info.stdout.split(' ')[0]) }} {{ (disk_info.stdout.split(' ')[1]) }}
+      when: (disk_info.stdout.split(' ')[1] | trim) != ""
+      register: gp
+      failed_when: gp.rc not in [0, 1, 2]
+      changed_when: gp.rc == 0
+
+    - name: Resize the filesystem to fill the (grown) device
+      ansible.builtin.shell: |
+        SRC="{{ data_src.stdout }}"
+        FSTYPE=$(findmnt -no FSTYPE /data)
+        if [ "$FSTYPE" = "xfs" ]; then xfs_growfs /data; else resize2fs "$SRC"; fi
+      register: rs
+      changed_when: "'blocks long' in rs.stdout or 'to ' in rs.stdout"
+
+    - name: Report new size
+      ansible.builtin.command: df -h /data
+      register: dfout
+      changed_when: false
+      check_mode: false # read-only 리포트
+    - ansible.builtin.debug:
+        var: dfout.stdout_lines
