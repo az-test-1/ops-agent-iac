@@ -1,0 +1,178 @@
+# auto-merge.yml — 봇 PR 중 무소유(auto) 경로만 guard 통과를 확인한 뒤 머지하고,
+# apply까지 dispatch한다. 대상:
+#   - dev 브랜치: 2-1-dev/** · modules/** · ansible/** — surface tfvars에 더해
+#     에이전트 코드 PR(dev CODEOWNERS가 이 경로들의 소유를 해제한다). 기능 추가는
+#     dev에서 자동으로 검증하고, prod 반영은 dev→main 승격 PR에서 사람이 승인한다.
+#     비용 상한은 tf-plan.yml의 비용 가드레일이 guard 단계에서 2차로 지킨다.
+#   - main 브랜치: 2-2-prod/waf.auto.tfvars.json (존 전역 WAF, 2-2-prod 소유 —
+#                  차단은 incident 대응이라 auto. 구 2-4-waf 통합, 2026-07-20)
+#                  2-2-prod/access-expiry.auto.tfvars.json (만료 전용 revoke-only 상태;
+#                  ops/access-expiry-prod 봇 PR만 허용)
+#                  ansible/patch-extra-packages.yml (2-08 패키지 surface, prod 몫 — 정본 main)
+# 나머지 prod 서비스 surface(2-2-prod/**)는 CODEOWNERS 소유 — 여기서 다루지 않는다(사람 머지).
+# main으로 오는 승격 PR(dev→main)은 사람 저작이라 아래 bot 필터에서 걸러진다.
+# auto/human 최종 판정은 CODEOWNERS + ruleset이 한다.
+#
+# guard 게이트는 이 워크플로가 직접 잡는다: private 리포가 free plan이면 ruleset
+# required check가 강제되지 않아(GitHub 제약), 네이티브 auto-merge에 맡기면 guard
+# 보고 전 즉시 머지된다. 유료 플랜 리포는 ruleset도 guard를 강제하지만(이중 게이트),
+# free 리포는 이 폴링이 유일한 guard 게이트다 — 플랜·공개여부와 무관하게 동작하도록
+# guard check 결론을 폴링해 success일 때만 머지한다.
+# synchronize 트리거: access-expiry가 열린 expiry PR에 force-push로 스윕 결과를
+# 갱신하는 경우 재평가가 필요하다(머지는 guard 재통과 후).
+name: auto-merge
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize]
+    branches: [dev, main]
+    paths:
+      - "2-1-dev/**"
+      - "modules/**"
+      - "ansible/**"
+      - "2-2-prod/waf.auto.tfvars.json"
+      - "2-2-prod/access-expiry.auto.tfvars.json"
+
+# contents: 머지용 write. pull-requests: PR 조회·머지. actions: 후속 tf-apply /
+# ansible-ops dispatch용 write. checks: guard check-run 결론 폴링용 read.
+permissions:
+  contents: write
+  pull-requests: write
+  actions: write
+  checks: read
+
+jobs:
+  enable-automerge:
+    # 봇 PR만 대상 — 사람 PR(승격 PR 포함)은 일반 리뷰·수동 머지 경로로 간다.
+    if: endsWith(github.event.pull_request.user.login, '[bot]')
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+      BASE_REF: ${{ github.event.pull_request.base.ref }}
+      HEAD_REF: ${{ github.event.pull_request.head.ref }}
+    steps:
+      - name: auto 경로 판별 + auto-merge 켜기
+        id: gate
+        run: |
+          set -euo pipefail
+          PR=${{ github.event.pull_request.number }}
+          FILES=$(gh pr view "$PR" --json files --jq '.files[].path')
+          # 봇 PR이 무소유 auto 경로 파일만으로 구성됐을 때만 auto-merge를 켠다.
+          # (소유 경로가 섞이면 code-owner 리뷰 대상 — auto-merge를 켜면
+          #  '승인 즉시 자동 머지'로 게이트 의미가 바뀌므로 켜지 않는다.)
+          if [ "$BASE_REF" = "main" ]; then
+            NON_AUTO=$(echo "$FILES" | grep -vE '^(2-2-prod/(waf|access-expiry)\.auto\.tfvars\.json|ansible/patch-extra-packages\.yml)$' || true)
+          else
+            # dev: surface tfvars + 코드 경로(modules/·2-1-dev/·ansible/). env.auto.tfvars
+            # 는 dev CODEOWNERS에서도 2-1-dev/ 해제에 포함된다(사용자 결정 2026-07-20).
+            # 예외: ansible/specs/(파라미터 스펙)는 dev에서도 사람 소유 — auto 불가
+            # (2026-08-07: 파라미터 조치의 입력 계약은 dev 진입부터 사람이 승인).
+            NON_AUTO=$(echo "$FILES" | grep -vE '^(2-1-dev|modules|ansible)/' || true)
+            SPEC_FILES=$(echo "$FILES" | grep -E '^ansible/specs/' || true)
+            NON_AUTO=$(printf '%s\n%s' "$NON_AUTO" "$SPEC_FILES" | grep -v '^$' || true)
+          fi
+          if [ -n "$NON_AUTO" ]; then
+            echo "auto 아님 — 무소유 auto 경로 외 파일 포함:"; echo "$NON_AUTO"
+            echo "auto=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          # prod expiry 파일은 권한을 줄이기만 하지만, 일반 봇 PR의 쓰기 표면으로
+          # 넓히지 않는다. 스케줄러의 고정 브랜치 + 단일 파일 PR일 때만 자동 처리.
+          if echo "$FILES" | grep -qx '2-2-prod/access-expiry\.auto\.tfvars\.json'; then
+            if [ "$HEAD_REF" != "ops/access-expiry-prod" ] ||
+               [ "$FILES" != "2-2-prod/access-expiry.auto.tfvars.json" ]; then
+              echo "auto 아님 — prod expiry는 ops/access-expiry-prod 단일 파일 PR만 허용"
+              echo "auto=false" >> "$GITHUB_OUTPUT"; exit 0
+            fi
+          fi
+          # guard 통과 대기 후 직접 머지. 네이티브 auto-merge(--auto)는 ruleset이
+          # 강제되지 않는 환경(private+free)에서 즉시 direct merge로 떨어져 guard를
+          # 건너뛴다 — 게이트는 여기서 잡는다(파일 상단 주석 참고).
+          SHA=$(gh pr view "$PR" --json headRefOid --jq .headRefOid)
+          echo "guard 대기(최대 10분) — commit $SHA"
+          CONCLUSION=""
+          for i in $(seq 1 40); do
+            CONCLUSION=$(gh api "repos/$GH_REPO/commits/$SHA/check-runs" \
+              --jq '[.check_runs[] | select(.name=="guard")][0].conclusion // empty' || true)
+            case "$CONCLUSION" in success|failure|cancelled|timed_out) break;; esac
+            sleep 15
+          done
+          if [ "$CONCLUSION" != "success" ]; then
+            echo "guard 미통과(conclusion=${CONCLUSION:-미보고}) — 머지하지 않는다. PR은 열려 있다."
+            echo "auto=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          # synchronize 재평가 등으로 이미 머지된 경우는 통과시킨다.
+          PR_STATE=$(gh pr view "$PR" --json state,headRefOid)
+          STATE=$(echo "$PR_STATE" | jq -r .state)
+          CURRENT_SHA=$(echo "$PR_STATE" | jq -r .headRefOid)
+          if [ "$STATE" = "OPEN" ]; then
+            if [ "$CURRENT_SHA" != "$SHA" ]; then
+              echo "head 변경 감지($SHA → $CURRENT_SHA) — 새 synchronize 실행이 재검증한다."
+              echo "auto=false" >> "$GITHUB_OUTPUT"; exit 0
+            fi
+            # --match-head-commit: 서버 측 원자 검증 — 위 검사와 머지 사이의 찰나에
+            # head가 또 바뀌는 레이스까지 잡는다(검증한 커밋이 아니면 머지 거부).
+            gh pr merge "$PR" --squash --match-head-commit "$SHA"
+            echo "guard success → 머지 완료"
+          fi
+          echo "auto=true" >> "$GITHUB_OUTPUT"
+
+      - name: auto면 apply dispatch
+        if: steps.gate.outputs.auto == 'true'
+        run: |
+          set -euo pipefail
+          PR=${{ github.event.pull_request.number }}
+          FILES=$(gh pr view "$PR" --json files --jq '.files[].path')
+          STATE=$(gh pr view "$PR" --json state --jq .state)
+          if [ "$STATE" != "MERGED" ]; then
+            echo "PR #$PR 미머지(state=$STATE) — human 경로. 사람 머지 시 push 트리거가 apply."
+            exit 0
+          fi
+          # GitHub API 일시 장애(503)로 dispatch가 유실되면 머지-미반영 드리프트가
+          # 남는다(2026-07-20 PR #236) — 재시도로 흡수하고, 최종 실패는 명시적으로 낸다.
+          dispatch() {
+            for i in 1 2 3; do
+              if gh workflow run "$@"; then return 0; fi
+              echo "::warning::dispatch 실패($i/3): gh workflow run $* — 15초 후 재시도"
+              sleep 15
+            done
+            echo "::error::dispatch 3회 실패: gh workflow run $* — 수동 실행 필요"
+            return 1
+          }
+          # 삭제성 전환 판정(2026-07-31 무승인 destroy 수정): GITHUB_TOKEN 머지는
+          # push 이벤트를 억제하므로 tf-apply의 push diff 감지가 이 경로를 못 본다.
+          # service.auto.tfvars에 service_enabled=false가 추가되는 PR인지 여기서
+          # 판정해 dispatch 입력으로 넘긴다 — approve-destroy 게이트가 받는다.
+          DESTRUCTIVE=false
+          if gh pr diff "$PR" | awk '
+              /^diff --git/ { f = ($0 ~ /service\.auto\.tfvars/) }
+              f && /^\+[[:space:]]*service_enabled[[:space:]]*=[[:space:]]*false/ { found=1 }
+              END { exit !found }'; then
+            DESTRUCTIVE=true
+          fi
+          # 파일 집합으로 후속 dispatch를 결정한다(첫 파일의 디렉토리가 아니라 전체 매칭 —
+          # 코드 PR은 modules/ + 2-1-dev/가 섞일 수 있다).
+          if echo "$FILES" | grep -qE '^(2-1-dev|modules)/'; then
+            # --ref dev: dev apply는 dev 브랜치 코드로 돌아야 한다(기본 ref는 main이라
+            # stale 코드 apply + detect의 브랜치 검증에 걸림). native auto-merge
+            # (GITHUB_TOKEN) 머지는 push 이벤트를 억제해 dispatch가 필요하다.
+            echo "merged(auto) → tf-apply dispatch (target=2-1-dev, ref=dev, destructive=$DESTRUCTIVE)"
+            dispatch tf-apply.yml --ref dev -f target=2-1-dev -f destructive="$DESTRUCTIVE"
+            if echo "$FILES" | grep -q '/disk\.auto\.tfvars$'; then
+              # disk surface면 growpart(ansible disk-grow)까지 dispatch — 순서(EBS
+              # 확대 → growpart)는 ansible-ops의 tf-apply 완료 대기 스텝이 보장.
+              # --ref dev: ansible/도 dev에서 에이전트 수정 가능 — dev 실행은 dev 코드로.
+              echo "disk surface → ansible-ops(disk-grow, dev) dispatch"
+              dispatch ansible-ops.yml --ref dev -f environment=dev -f playbook=disk-grow
+            fi
+          elif echo "$FILES" | grep -q '^2-2-prod/'; then
+            # main auto 경로는 WAF 또는 expiry revoke-only surface — 2-2-prod apply.
+            echo "merged(auto) → tf-apply dispatch (target=2-2-prod, ref=main, destructive=$DESTRUCTIVE)"
+            dispatch tf-apply.yml --ref main -f target=2-2-prod -f destructive="$DESTRUCTIVE"
+          elif echo "$FILES" | grep -q '^ansible/'; then
+            # ansible-only 변경은 terraform 대상이 아니다 — 플레이북·패키지 목록은
+            # 다음 ansible-ops dispatch(에이전트 또는 사람)가 소비한다. 머지 확인만.
+            echo "ansible 변경 머지 완료 — apply dispatch 없음(다음 ansible-ops 실행이 소비)"
+          else
+            echo "::warning::머지됐지만 PR #$PR에서 dispatch 대상을 못 찾음 — 생략"
+          fi

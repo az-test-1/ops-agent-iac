@@ -1,0 +1,61 @@
+---
+# rds-readonly-user.yml — dev 상시 `readonly` 계정을 만든다(멱등).
+# 과거에는 bastion user_data(부팅 1회)가 만들었으나, 부팅 타이밍 실패가 조용히
+# 넘어가고 재실행 경로가 없어 ansible로 이관했다(2026-08-01) — dev 세팅 apply
+# 성공 후 에이전트가 dispatch한다. prod는 상시 계정 없음(rds-temp-user만) —
+# workflow가 dev 외 환경을 거부한다.
+#
+# 비밀번호는 강의 자료로 전달되는 데모 고정값(리포 공개 전제 — dev 전용 수용).
+#
+# 필수 extra-vars:
+#   db_host db_admin_password
+# 선택:
+#   db_name(기본 appdb) db_admin_user(기본 dbadmin)
+#   readonly_password(기본 데모 값)
+- name: Provision the standing dev readonly RDS user (via bastion)
+  hosts: role_bastion
+  gather_facts: false
+  vars:
+    db_name: appdb
+    db_admin_user: dbadmin
+    readonly_password: "ReadOnlyDemo2026!"
+  tasks:
+    - name: Require inputs
+      ansible.builtin.assert:
+        that:
+          - db_host is defined and (db_host | length) > 0
+          - db_admin_password is defined and (db_admin_password | length) > 0
+        fail_msg: "db_host, db_admin_password 는 필수 extra-var."
+
+    - name: Ensure psql present
+      ansible.builtin.apt:
+        name: postgresql-client
+        state: present
+      become: true
+
+    - name: Create or update the readonly role + SELECT grants (idempotent)
+      ansible.builtin.shell: |
+        set -euo pipefail
+        psql "host={{ db_host }} dbname={{ db_name }} user={{ db_admin_user }} sslmode=require" -v ON_ERROR_STOP=1 <<'SQL'
+        DO $$
+        BEGIN
+          IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'readonly') THEN
+            ALTER ROLE readonly WITH LOGIN PASSWORD '{{ readonly_password }}';
+          ELSE
+            CREATE ROLE readonly WITH LOGIN PASSWORD '{{ readonly_password }}';
+          END IF;
+        END $$;
+        GRANT CONNECT ON DATABASE {{ db_name }} TO readonly;
+        GRANT USAGE ON SCHEMA public TO readonly;
+        GRANT SELECT ON ALL TABLES IN SCHEMA public TO readonly;
+        ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO readonly;
+        SQL
+      args:
+        executable: /bin/bash
+      environment:
+        PGPASSWORD: "{{ db_admin_password }}"
+      no_log: true
+
+    - name: Report
+      ansible.builtin.debug:
+        msg: "standing readonly user ensured on {{ db_host }} (SELECT-only, db={{ db_name }})"

@@ -1,0 +1,7 @@
+# rds-readonly-user 파라미터 스펙 — 사람 소유(CODEOWNERS, dev 브랜치 포함).
+#
+# 파라미터 없음. envs로 dev에 한정한다 — prod 상시 계정 금지 계약(prod는
+# rds-temp-user만). derived는 러너에서만 알 수 있는 값으로, 엔진 provider가
+# 조회해 주입한다(db_host = dev RDS 엔드포인트, db_admin_password = GHA secret).
+envs: [dev]
+derived: [db_host, db_admin_password]

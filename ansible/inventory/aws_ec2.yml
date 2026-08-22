@@ -1,0 +1,24 @@
+# aws_ec2 동적 인벤토리 — 실행 시점 AWS 조회(파일 생성 없음).
+# Role/Environment 태그로 그룹핑: role_app, role_bastion, env_dev, env_prod.
+# 워크플로는 --limit env_dev | env_prod 로 대상 환경을 좁힌다.
+plugin: amazon.aws.aws_ec2
+regions:
+  - ap-northeast-2
+filters:
+  instance-state-name: running
+  tag:Role:
+    - app
+    - bastion
+keyed_groups:
+  - key: tags.Role
+    prefix: role
+    separator: "_"
+  - key: tags.Environment
+    prefix: env
+    separator: "_"
+# 러너는 VPC 안에 상주하며 대상 호스트에 사설 IP로 붙는다. 공인 IP(ip-address)로
+# 붙으면 트래픽이 IGW로 나갔다 들어오며 소스가 러너의 공인/NAT IP로 바뀌어 SG의
+# runner-SG-소스 규칙(fleet_ssh_from_runner)이 매칭되지 않는다(+ 퍼블릭 IP 헤어핀
+# 실패 → UNREACHABLE). 사설 IP로 붙어야 SG-to-SG 규칙이 적용된다.
+hostnames:
+  - private-ip-address

@@ -1,0 +1,26 @@
+# Terraform
+**/.terraform/
+*.tfstate
+*.tfstate.*
+# 로컬 루트의 시크릿 변수 파일 (surface는 *.auto.tfvars라 영향 없음)
+terraform.tfvars
+*.tfplan
+# Python
+__pycache__/
+.pytest_cache/
+*.pyc
+# Local
+.DS_Store
+.env
+.env.*
+.playwright-mcp/
+
+# GitHub App private key + metadata (per-student, never commit)
+.secrets/
+
+# terraform init artifacts (validation runs; CI inits fresh)
+.terraform/
+.terraform.lock.hcl
+
+# course docs — delivered outside the repo, keep local only
+docs/

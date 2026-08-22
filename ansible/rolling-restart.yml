@@ -1,0 +1,75 @@
+---
+# rolling-restart.yml — ALB 뒷단 app 인스턴스를 무중단 지향으로 재시작(2-3 incident-response).
+#
+# 메모리 누수 / 행(up==0) 알람 대응: TG에서 빼고(연결 드레인) → 서비스 재시작 →
+# /healthz 확인 → TG로 복귀. serial: 1로 한 대씩(플릿이 여러 대여도 롤링).
+# 대상 환경은 워크플로가 --limit env_dev|env_prod 로 좁힌다.
+#
+# instance_id / tags 는 aws_ec2 동적 인벤토리가 hostvar로 준다. TG 조작(describe/
+# (de)register/wait)은 러너의 인스턴스 롤 권한으로 localhost에서 aws CLI로 수행한다.
+- name: Rolling restart of the app fleet behind the ALB
+  hosts: role_app
+  become: true
+  serial: 1
+  vars:
+    # TG 이름(<project>-<env>-tg)의 project 부분. PROJECT_NAME을 재정의한 리포에서도
+    # 동작하도록 env PROJECT(ansible-ops.yml이 주입)를 우선 읽는다.
+    project: "{{ lookup('env', 'PROJECT') | default('ops-agent-iac', true) }}"
+    app_service: app # ops-agent-app install.sh가 등록하는 systemd 유닛명(app.service)
+    region: "{{ lookup('env', 'AWS_REGION') | default('ap-northeast-2', true) }}"
+  tasks:
+    - name: Resolve this environment's target group ARN
+      delegate_to: localhost
+      become: false
+      ansible.builtin.command: >
+        aws elbv2 describe-target-groups --region {{ region }}
+        --names {{ project }}-{{ tags.Environment | default('dev') }}-tg
+        --query TargetGroups[0].TargetGroupArn --output text
+      register: tg_arn
+      changed_when: false
+      check_mode: false # read-only 조회 — dry_run(--check)에서도 TG ARN을 확보해야 뒤 태스크가 죽지 않는다
+
+    - name: Deregister from the target group (drain)
+      delegate_to: localhost
+      become: false
+      ansible.builtin.command: >
+        aws elbv2 deregister-targets --region {{ region }}
+        --target-group-arn {{ tg_arn.stdout }} --targets Id={{ instance_id }}
+
+    - name: Wait for connection draining to complete
+      delegate_to: localhost
+      become: false
+      ansible.builtin.command: >
+        aws elbv2 wait target-deregistered --region {{ region }}
+        --target-group-arn {{ tg_arn.stdout }} --targets Id={{ instance_id }}
+
+    - name: Restart the app service
+      ansible.builtin.systemd:
+        name: "{{ app_service }}"
+        state: restarted
+
+    - name: Wait for local health (/healthz on :8080)
+      ansible.builtin.uri:
+        url: http://127.0.0.1:8080/healthz
+        status_code: 200
+      register: hz
+      retries: 12
+      delay: 5
+      until: hz.status == 200
+
+    - name: Register back to the target group
+      delegate_to: localhost
+      become: false
+      ansible.builtin.command: >
+        aws elbv2 register-targets --region {{ region }}
+        --target-group-arn {{ tg_arn.stdout }} --targets Id={{ instance_id }}
+
+    - name: Wait until healthy in the target group
+      delegate_to: localhost
+      become: false
+      ansible.builtin.command: >
+        aws elbv2 wait target-in-service --region {{ region }}
+        --target-group-arn {{ tg_arn.stdout }} --targets Id={{ instance_id }}
+
+    - ansible.builtin.debug:
+        msg: "restarted {{ inventory_hostname }} ({{ instance_id }}) — drained → restart → healthy"
