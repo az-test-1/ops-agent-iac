@@ -1,3 +1,3 @@
-service_enabled   = true
+service_enabled   = false
 ec2_instance_type = "t3.micro"
 db_instance_class = "db.t3.micro"
