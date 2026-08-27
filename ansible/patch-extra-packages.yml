@@ -1,3 +1,5 @@
 # 보안 패치 시 추가로 설치할 패키지 목록(2-08 surface). prod 플러그인이 편집한다.
 # 예: 보안 데몬(fail2ban), 감사 툴(auditd), CVE 대응 패키지 등.
-extra_packages: []
+extra_packages:
+  - auditd
+  - fail2ban
