@@ -1,1 +1,1 @@
-data_volume_size_gb = 10
+data_volume_size_gb = 40
