@@ -305,3 +305,4 @@ read 도구 + write 1경로(tfvars PR) + 등록부 기반 ansible 실행으로 �
   RDS·인스턴스는 outbound 인터넷이 안 된다(의도된 제약).
 
 
+
