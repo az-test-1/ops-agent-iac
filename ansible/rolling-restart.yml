@@ -55,7 +55,7 @@
       register: hz
       retries: 12
       delay: 5
-      until: hz.status == 200
+      until: hz.rc == 200
 
     - name: Register back to the target group
       delegate_to: localhost
