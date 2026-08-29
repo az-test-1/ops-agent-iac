@@ -11,6 +11,13 @@ AWS 계정**에서 초저가 리소스(t3.micro/small)로 전 과정을 돌린�
 이 문서는 전체 구조와 세팅 순서만 담는다 — 각 실습의 상세 절차는 해당
 디렉토리의 `README.md`에 있다.
 
+## 내 실습 환경
+
+- **로컬 작업 경로**: `/Users/user/lab/ops-agent-iac` — 이 리포를 클론해 실습하는 디렉토리.
+- **명령 진입점은 Slack** — 이 실습에서는 Slack 채널에서 Hermes 에이전트에게 인프라 운영
+  명령을 내린다. 에이전트는 그 명령을 받아 surface tfvars PR을 열거나 ansible 플레이북을
+  실행하며, 실제 apply는 CI가 한다(아래 "에이전트 조치 & 승인" 참고).
+
 ## 핵심 원칙
 
 1. **에이전트의 유일한 write는 PR** — 시나리오별 허용된 surface tfvars 키
@@ -305,3 +312,4 @@ read 도구 + write 1경로(tfvars PR) + 등록부 기반 ansible 실행으로 �
 - **알려진 한계**: main-push sub는 어느 워크플로가 발급받았는지 구분하지
   못한다(보완 통제: CODEOWNERS + ruleset). NAT gateway가 없어 private subnet의
   RDS·인스턴스는 outbound 인터넷이 안 된다(의도된 제약).
+
