@@ -317,3 +317,4 @@ read 도구 + write 1경로(tfvars PR) + 등록부 기반 ansible 실행으로 �
 
 
 
+
